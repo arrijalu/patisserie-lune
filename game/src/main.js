@@ -1,19 +1,18 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// Boot, WebAudio procedural audio, game loop, and screenshot mode for Pâtisserie Lune
+import { BEST_KEY, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createWorld, EVENT_ADD_INGREDIENT, EVENT_BAKE_START, EVENT_BAKE_DONE, EVENT_SERVE_SUCCESS, EVENT_SERVE_FAIL, EVENT_SHIFT_END } from './world.js';
+import { ACTION_ACT, ACTION_PAUSE, createInput } from './input.js';
+import { createRenderer, SCREEN_TITLE, SCREEN_PLAY, SCREEN_SHIFT_END } from './render.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+// Catch runtime errors so automated runners catch issues
+window.onerror = function (message, source, lineno, colno, error) {
+  document.title = 'ERR: ' + message;
+  console.error('Pâtisserie Lune Error:', message, source, lineno, colno, error);
+};
 
+const MAX_FRAME = 0.25;
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
@@ -23,6 +22,59 @@ const canvas = document.getElementById('game');
 const status = document.getElementById('status');
 const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
+
+// Procedural WebAudio setup (lazily initialized after first user gesture)
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (AudioContext) audioCtx = new AudioContext();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+}
+
+function playSound(type) {
+  try {
+    initAudio();
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+
+    if (type === 'add') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(440, now);
+      osc.frequency.exponentialRampToValueAtTime(880, now + 0.1);
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+      osc.start(now);
+      osc.stop(now + 0.12);
+    } else if (type === 'serve') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(523.25, now); // C5
+      osc.frequency.setValueAtTime(659.25, now + 0.1); // E5
+      osc.frequency.setValueAtTime(783.99, now + 0.2); // G5
+      gain.gain.setValueAtTime(0.25, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+      osc.start(now);
+      osc.stop(now + 0.4);
+    } else if (type === 'fail') {
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(150, now);
+      osc.frequency.linearRampToValueAtTime(80, now + 0.3);
+      gain.gain.setValueAtTime(0.3, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+      osc.start(now);
+      osc.stop(now + 0.3);
+    }
+  } catch {
+    // Audio restriction fallbacks
+  }
+}
 
 function readBest() {
   try {
@@ -36,20 +88,15 @@ function saveBest(value) {
   try {
     window.localStorage.setItem(BEST_KEY, String(value));
   } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+    // Storage fallback
   }
 }
 
 function runShot(name) {
+  console.log('RUNNING SHOT:', name);
   const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
+  renderer.draw(world.state, scene.screen, scene.best);
+  window.__shotReady = true;
 }
 
 function runGame() {
@@ -59,47 +106,48 @@ function runGame() {
   let accumulator = 0;
   let last = performance.now();
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+  function announce(msg) {
+    status.textContent = msg;
   }
 
-  function startGame() {
+  function startShift() {
     world.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    announce('Shift started. Welcome to Pâtisserie Lune.');
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
+  function endShift() {
+    screen = SCREEN_SHIFT_END;
     if (world.state.score > best) {
       best = world.state.score;
       saveBest(best);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    announce(`Shift complete. Score ${world.state.score}. Best ${best}.`);
   }
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+    if (actions & ACTION_ACT && (screen === SCREEN_TITLE || screen === SCREEN_SHIFT_END)) {
+      startShift();
+    } else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
+      screen = SCREEN_TITLE;
       announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
     }
   }
 
   function step() {
     if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+      world.step(STEP, 0, 0, null);
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    const pointer = input.pointer();
+    const events = world.step(STEP, input.direction(), input.takeActions(), pointer);
+
+    if (events & EVENT_SHIFT_END) endShift();
+    if (events & (EVENT_ADD_INGREDIENT | EVENT_BAKE_START | EVENT_BAKE_DONE)) playSound('add');
+    if (events & EVENT_SERVE_SUCCESS) playSound('serve');
+    if (events & EVENT_SERVE_FAIL) playSound('fail');
   }
 
   function frame(now) {
@@ -107,6 +155,7 @@ function runGame() {
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
     handleActions();
+
     if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
       while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
         step();
@@ -118,15 +167,14 @@ function runGame() {
     renderer.draw(world.state, screen, best);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+      screen = SCREEN_TITLE;
       announce('Paused.');
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Pâtisserie Lune. Press Space or Click to start.');
   requestAnimationFrame(frame);
 }
 
